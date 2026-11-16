@@ -27,12 +27,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt  # 如果有依赖文件
 
-      # 4. 运行脚本并捕获输出
+      # 4. 单元测试（多账号解析与签到流程，全部 mock，不触网）
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s tests -t . -v
+
+      # 5. 运行脚本并捕获输出
       - name: Run auto checkin script
-        id: run_script  # 给步骤命名，方便后续引用输出
-        continue-on-error: true
         env:
           TOKEN: ${{ secrets.TOKEN }}
+          TOKENS: ${{ secrets.TOKENS }}
           DEBUG: ${{ secrets.DEBUG }}
           BARK_DEVICE_KEY: ${{ secrets.BARK_DEVICE_KEY }}
           BARK_SERVER_URL: ${{ secrets.BARK_SERVER_URL }}

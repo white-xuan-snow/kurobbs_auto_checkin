@@ -1,7 +1,8 @@
 import os
 import sys
-from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, List, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 import requests
@@ -10,7 +11,12 @@ from pydantic import BaseModel, Field
 
 from ext_notification import NotificationService
 from logging_utils import configure_logger
-from settings import Settings, SettingsError, parse_bool
+from settings import (
+    Settings,
+    SettingsError,
+    collect_sensitive_values,
+    parse_bool,
+)
 
 
 class Response(BaseModel):
@@ -22,6 +28,20 @@ class Response(BaseModel):
 
 class KurobbsClientException(Exception):
     """Custom exception for Kurobbs client errors."""
+
+
+def _beijing_timezone():
+    """Asia/Shanghai time zone, falling back to a fixed +08:00 offset.
+
+    Some platforms (e.g. Windows without the tzdata package) ship no IANA time
+    zone database, so ZoneInfo raises instead of resolving the key. The offset of
+    Asia/Shanghai has been +08:00 without DST since 1991, so the fallback keeps
+    the month used for ``reqMonth`` identical.
+    """
+    try:
+        return ZoneInfo("Asia/Shanghai")
+    except Exception:  # noqa: BLE001 - ZoneInfoNotFoundError / ImportError on missing tzdata
+        return timezone(timedelta(hours=8))
 
 
 class KurobbsClient:
@@ -55,6 +75,7 @@ class KurobbsClient:
         )
         self.result: Dict[str, str] = {}
         self.exceptions: List[Exception] = []
+        self._mine_info: Optional[Dict[str, Any]] = None
 
     def _post(self, url: str, data: Dict[str, Any]) -> Response:
         """Make a POST request to the specified URL with the given data."""
@@ -83,7 +104,16 @@ class KurobbsClient:
         res = self._post(self.USER_MINE_URL, {"type": type})
         if not res.data:
             raise KurobbsClientException("User info is missing in response.")
+        self._mine_info = res.data
         return res.data
+
+    @property
+    def nickname(self) -> Optional[str]:
+        """Nickname from the cached mine info, or None when it is unavailable."""
+        if not self._mine_info:
+            return None
+        mine = self._mine_info.get("mine") or {}
+        return mine.get("nickname") or None
 
     def get_user_game_list(self, user_id: int) -> Dict[str, Any]:
         """Get the list of games for the user."""
@@ -97,7 +127,7 @@ class KurobbsClient:
         mine_info = self.get_mine_info()
         user_game_list = self.get_user_game_list(user_id=mine_info.get("mine", {}).get("userId", 0))
 
-        beijing_tz = ZoneInfo("Asia/Shanghai")
+        beijing_tz = _beijing_timezone()
         beijing_time = datetime.now(beijing_tz)
 
         role_list = user_game_list.get("defaultRoleList") or []
@@ -163,16 +193,98 @@ class KurobbsClient:
             raise KurobbsClientException("; ".join(map(str, self.exceptions)))
 
 
+@dataclass
+class AccountResult:
+    """Outcome of one account check-in."""
+
+    index: int
+    label: str
+    ok: bool
+    message: str
+
+
+def checkin_account(index: int, token: str) -> AccountResult:
+    """Check in a single account. Never raises."""
+    label = f"账号#{index}"
+    client: Optional[KurobbsClient] = None
+    try:
+        client = KurobbsClient(token)
+        client.start()
+    except KurobbsClientException as exc:
+        return AccountResult(
+            index=index,
+            label=_account_label(client, index),
+            ok=False,
+            message=str(exc),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("账号 [{}] 签到时发生未预期异常: {}", label, exc)
+        return AccountResult(
+            index=index,
+            label=_account_label(client, index),
+            ok=False,
+            message=str(exc),
+        )
+
+    return AccountResult(
+        index=index,
+        label=_account_label(client, index),
+        ok=True,
+        message=client.msg or "签到成功",
+    )
+
+
+def _account_label(client: Optional[KurobbsClient], index: int) -> str:
+    """Nickname when the mine info was fetched, otherwise the positional label."""
+    nickname = client.nickname if client is not None else None
+    return nickname or f"账号#{index}"
+
+
+def format_report(results: Sequence[AccountResult]) -> str:
+    """Render the aggregated report. Never contains a raw token."""
+    if not results:
+        return ""
+
+    lines = []
+    for result in results:
+        status = "成功" if result.ok else "失败"
+        lines.append(f"[{result.index}] {result.label} -> {status}: {result.message}")
+
+    ok_count = sum(1 for result in results if result.ok)
+    fail_count = len(results) - ok_count
+    lines.append(f"共 {len(results)} 个账号：成功 {ok_count}，失败 {fail_count}")
+    return "\n".join(lines)
+
+
+def run(tokens: Sequence[str], notifier: NotificationService) -> int:
+    """Check in every account serially, push one report, return the exit code."""
+    total = len(tokens)
+    results: List[AccountResult] = []
+
+    for index, token in enumerate(tokens, start=1):
+        logger.info("===== 账号 [{}/{}] =====", index, total)
+        result = checkin_account(index, token)
+        results.append(result)
+        if result.ok:
+            logger.info("账号 [{}] 签到成功: {}", result.label, result.message)
+        else:
+            logger.error("账号 [{}] 签到失败: {}", result.label, result.message)
+
+    if results:
+        notifier.send(format_report(results))
+
+    ok_count = sum(1 for result in results if result.ok)
+    fail_count = len(results) - ok_count
+    logger.info("全部完成：成功 {}，失败 {}", ok_count, fail_count)
+    return 0 if fail_count == 0 else 1
+
+
 def main():
-    # Configure logging as early as possible to avoid leaking secrets in GitHub Actions logs.
+    # Configure logging as early as possible so that every token is already redacted
+    # before settings (and any log line mentioning them) come into play.
     configure_logger(
         debug=parse_bool(os.getenv("DEBUG", "")),
-        secrets=[
-            os.getenv("TOKEN", ""),
-            os.getenv("BARK_DEVICE_KEY", ""),
-            os.getenv("BARK_SERVER_URL", ""),
-            os.getenv("SERVER3_SEND_KEY", ""),
-        ],
+        secrets=collect_sensitive_values(),
     )
 
     try:
@@ -181,20 +293,7 @@ def main():
         logger.error(str(exc))
         sys.exit(1)
 
-    notifier = NotificationService(settings)
-
-    try:
-        kurobbs = KurobbsClient(settings.token)
-        kurobbs.start()
-        if kurobbs.msg:
-            notifier.send(kurobbs.msg)
-    except KurobbsClientException as e:
-        logger.error(str(e))
-        notifier.send(str(e))
-        sys.exit(1)
-    except Exception as e:  # noqa: BLE001
-        logger.exception("An unexpected error occurred: {}", e)
-        sys.exit(1)
+    sys.exit(run(settings.tokens, NotificationService(settings)))
 
 
 if __name__ == "__main__":
