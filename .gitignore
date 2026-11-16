@@ -1,3 +1,6 @@
+# local scratch: device dumps and token files must never be committed
+scratch/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -10,7 +10,13 @@ import requests
 
 import auto_checkin
 import logging_utils
-from auto_checkin import KurobbsClient, format_report, run
+from auto_checkin import (
+    KurobbsClient,
+    KurobbsClientException,
+    Response,
+    format_report,
+    run,
+)
 from settings import Settings, collect_sensitive_values
 
 TOKEN_A = "tk_alpha_0001"
@@ -26,7 +32,7 @@ ROUTES = {
         "code": 0,
         "msg": "OK",
         "success": True,
-        "data": {"mine": {"userId": 123, "nickname": "小明"}},
+        "data": {"mine": {"userId": 123, "userName": "小明"}},
     },
     ROLE_URL: {
         "code": 0,
@@ -51,13 +57,14 @@ def _response(payload):
     return resp
 
 
-def _router(calls=None):
+def _router(calls=None, routes=None):
     """Return a requests.Session.post side effect that dispatches on the URL."""
+    table = ROUTES if routes is None else routes
 
     def fake_post(url, data=None, timeout=None, **kwargs):
         if calls is not None:
             calls.append(url)
-        return _response(ROUTES[url])
+        return _response(table[url])
 
     return fake_post
 
@@ -163,13 +170,136 @@ class AccountCheckinTest(unittest.TestCase):
         self.assertEqual(format_report([]), "")
 
 
+class AlreadySignedTest(unittest.TestCase):
+    """code=1511 ("请勿重复签到") is an idempotent success, not a failure."""
+
+    ALREADY_SIGNED = {"code": 1511, "success": False, "msg": "请勿重复签到"}
+
+    def setUp(self):
+        patcher = patch("requests.Session.post")
+        self.mock_post = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _routes(self, overrides=None):
+        routes = dict(ROUTES)
+        routes.update(overrides or {})
+        self.mock_post.side_effect = _router(routes=routes)
+        return routes
+
+    def test_both_sign_actions_already_signed_exit_zero(self):
+        self._routes(
+            {SIGN_URL: dict(self.ALREADY_SIGNED), USER_SIGN_URL: dict(self.ALREADY_SIGNED)}
+        )
+
+        results = []
+        notifier = MagicMock()
+        with patch("auto_checkin.checkin_account", side_effect=_recording_checkin(results)):
+            exit_code = run([TOKEN_A], notifier)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].ok)
+        self.assertIn("今日已签到", results[0].message)
+        notifier.send.assert_called_once()
+        report = notifier.send.call_args[0][0]
+        self.assertIn("今日已签到", report)
+        self.assertIn("成功 1，失败 0", report)
+
+    def test_already_signed_does_not_mask_an_expired_token(self):
+        mine_calls = {"count": 0}
+
+        def routed_post(url, data=None, timeout=None, **kwargs):
+            if url == MINE_URL:
+                mine_calls["count"] += 1
+                if mine_calls["count"] == 2:
+                    return _response(
+                        {"code": 220, "success": False, "msg": "登录已过期，请重新登录"}
+                    )
+            if url in (SIGN_URL, USER_SIGN_URL):
+                return _response(dict(self.ALREADY_SIGNED))
+            return _response(ROUTES[url])
+
+        self.mock_post.side_effect = routed_post
+
+        results = []
+        notifier = MagicMock()
+        with patch("auto_checkin.checkin_account", side_effect=_recording_checkin(results)):
+            exit_code = run([TOKEN_A, TOKEN_B], notifier)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual([result.ok for result in results], [True, False])
+        self.assertIn("今日已签到", results[0].message)
+        self.assertIn("code=220", results[1].message)
+        self.assertIn("token 已失效", results[1].message)
+        self.assertEqual(mine_calls["count"], 2)
+
+    def test_expired_token_is_not_treated_as_already_signed(self):
+        client = KurobbsClient(TOKEN_A)
+        resp = Response(code=220, msg="登录已过期，请重新登录", success=False)
+        self.assertFalse(client._is_already_signed(resp))
+        self.assertTrue(
+            client._is_already_signed(Response(code=1511, msg="", success=False))
+        )
+
+
+class ExpiredTokenTest(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("requests.Session.post")
+        self.mock_post = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_mine_code_220_raises_with_code_in_message(self):
+        routes = dict(ROUTES)
+        routes[MINE_URL] = {"code": 220, "success": False, "msg": "登录已过期，请重新登录"}
+        self.mock_post.side_effect = _router(routes=routes)
+
+        client = KurobbsClient(TOKEN_A)
+        with self.assertRaises(KurobbsClientException) as caught:
+            client.get_mine_info()
+
+        message = str(caught.exception)
+        self.assertIn("code=220", message)
+        self.assertIn("token 已失效", message)
+
+
 class NicknameTest(unittest.TestCase):
+    def _nickname_for(self, mine_payload):
+        routes = dict(ROUTES)
+        routes[MINE_URL] = mine_payload
+        with patch("requests.Session.post", side_effect=_router(routes=routes)):
+            client = KurobbsClient(TOKEN_A)
+            self.assertIsNone(client.nickname)
+            client.get_mine_info()
+            return client.nickname
+
     def test_nickname_comes_from_cached_mine_info(self):
         with patch("requests.Session.post", side_effect=_router()):
             client = KurobbsClient(TOKEN_A)
             self.assertIsNone(client.nickname)
             client.get_mine_info()
             self.assertEqual(client.nickname, "小明")
+
+    def test_nickname_uses_user_name_from_live_payload(self):
+        nickname = self._nickname_for(
+            {
+                "code": 200,
+                "msg": "请求成功",
+                "success": True,
+                "data": {"mine": {"userId": 30188029, "userName": "用户A", "level": 5}},
+            }
+        )
+        self.assertEqual(nickname, "用户A")
+
+    def test_nickname_falls_back_to_legacy_field(self):
+        nickname = self._nickname_for(
+            {
+                "code": 200,
+                "msg": "请求成功",
+                "success": True,
+                "data": {"mine": {"userId": 123, "nickname": "旧字段"}},
+            }
+        )
+        self.assertEqual(nickname, "旧字段")
 
 
 class LogRedactionTest(unittest.TestCase):

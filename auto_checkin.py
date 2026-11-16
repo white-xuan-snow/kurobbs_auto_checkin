@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,12 @@ class Response(BaseModel):
 
 class KurobbsClientException(Exception):
     """Custom exception for Kurobbs client errors."""
+
+
+# "Already signed in today" is an idempotent success, not a failure: the API
+# reports it as code=1511 / success=false with a "请勿重复签到" style message.
+ALREADY_SIGNED_CODES = frozenset({1511})
+_ALREADY_SIGNED_MSG = re.compile(r"已签到|已经签到|重复签到|签到过了")
 
 
 def _beijing_timezone():
@@ -103,17 +110,23 @@ class KurobbsClient:
         """Get mine info."""
         res = self._post(self.USER_MINE_URL, {"type": type})
         if not res.data:
-            raise KurobbsClientException("User info is missing in response.")
+            if res.code == 220:
+                raise KurobbsClientException(
+                    f"token 已失效（code=220），请重新获取: {res.msg}"
+                )
+            raise KurobbsClientException(
+                f"User info is missing in response (code={res.code}, msg={res.msg})"
+            )
         self._mine_info = res.data
         return res.data
 
     @property
     def nickname(self) -> Optional[str]:
         """Nickname from the cached mine info, or None when it is unavailable."""
-        if not self._mine_info:
-            return None
-        mine = self._mine_info.get("mine") or {}
-        return mine.get("nickname") or None
+        mine = (self._mine_info or {}).get("mine") or {}
+        # The live API exposes `userName`; `nickname` stays as a fallback for
+        # older payloads (and for the fixtures built before the rename).
+        return mine.get("userName") or mine.get("nickname")
 
     def get_user_game_list(self, user_id: int) -> Dict[str, Any]:
         """Get the list of games for the user."""
@@ -148,6 +161,17 @@ class KurobbsClient:
         """Perform the sign-in operation."""
         return self._post(self.USER_SIGN_URL, {"gameId": 2})
 
+    def _is_already_signed(self, resp: Response) -> bool:
+        """True when the response means "already signed in today".
+
+        An expired token (code=220) must never be mistaken for an idempotent
+        success, so the code set is explicit and the message regex only matches
+        the "already signed" wording.
+        """
+        if resp.code in ALREADY_SIGNED_CODES:
+            return True
+        return bool(_ALREADY_SIGNED_MSG.search(resp.msg or ""))
+
     def _process_sign_action(
         self,
         action_name: str,
@@ -160,6 +184,9 @@ class KurobbsClient:
         if resp.success:
             self.result[action_name] = success_message
             logger.info("{} -> {}", action_name, success_message)
+        elif self._is_already_signed(resp):
+            self.result[action_name] = f"{action_name} 今日已签到"
+            logger.info("{} -> 今日已签到，跳过", action_name)
         else:
             self.exceptions.append(KurobbsClientException(f"{failure_message}, {resp.msg}"))
 
