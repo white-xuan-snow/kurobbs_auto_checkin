@@ -11,9 +11,12 @@ import requests
 import auto_checkin
 import logging_utils
 from auto_checkin import (
+    WUWA_GAME_ID,
     KurobbsClient,
     KurobbsClientException,
     Response,
+    _select_wuwa_role,
+    checkin_account,
     format_report,
     run,
 )
@@ -39,8 +42,9 @@ ROUTES = {
         "msg": "OK",
         "success": True,
         "data": {
+            # The reward check-in only accepts the 鸣潮 role (gameId=3).
             "defaultRoleList": [
-                {"gameId": 2, "serverId": 1, "roleId": 9, "userId": 123}
+                {"gameId": 3, "serverId": 1, "roleId": 9, "userId": 123}
             ]
         },
     },
@@ -128,7 +132,9 @@ class AccountCheckinTest(unittest.TestCase):
         self.assertIn("failed", results[0].message)
         # The second account really reached the API and signed in both ways.
         self.assertEqual(mine_attempts["count"], 2)
-        self.assertEqual(urls.count(USER_SIGN_URL), 1)
+        # 单元 F: the first account's checkin failed, but its community sign-in
+        # was still attempted once (its /encourage call never happened).
+        self.assertEqual(urls.count(USER_SIGN_URL), 2)
         self.assertEqual(urls.count(SIGN_URL), 1)
         notifier.send.assert_called_once()
 
@@ -142,7 +148,9 @@ class AccountCheckinTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertEqual([result.ok for result in results], [False, False])
-        self.assertEqual(self.mock_post.call_count, 2)
+        # 单元 F: each account still tries both actions (mine fails, then the
+        # community sign-in is attempted and fails too) = 2 posts per account.
+        self.assertEqual(self.mock_post.call_count, 4)
         notifier.send.assert_called_once()
 
     def test_format_report_has_each_label_and_no_raw_token(self):
@@ -365,6 +373,202 @@ class MainEntryTest(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(notifier.send.call_count, 1)
         self.assertIn("账号#1", notifier.send.call_args[0][0])
+
+
+class WuwaRoleSelectionTest(unittest.TestCase):
+    """The reward check-in must use the 鸣潮 role (gameId=3), never list[0] blindly."""
+
+    # Real data observed for 丿一阵雨 (userId 30188029); 战双 comes first.
+    ZHANSHUANG_ROLE = {
+        "gameId": 2,
+        "gameHeadUrl": "https://web-static.kurobbs.com/app/role/game/zhanshuangIcon.png",
+        "roleId": "27804034",
+        "serverId": "1000",
+        "userId": 30188029,
+    }
+    WUWA_ROLE = {
+        "gameId": 3,
+        "gameHeadUrl": "https://web-static.kurobbs.com/app/role/game/mingchaoIcon.png",
+        "roleId": "130468743",
+        "serverId": "76402e5b20be2c39f095a152090afddc",
+        "userId": 30188029,
+    }
+
+    def setUp(self):
+        patcher = patch("requests.Session.post")
+        self.mock_post = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.post_urls = []
+        self.sign_payloads = []
+
+    def _serve(self, roles, user_id=30188029, user_name="丿一阵雨"):
+        routes = dict(ROUTES)
+        routes[MINE_URL] = {
+            "code": 200,
+            "msg": "请求成功",
+            "success": True,
+            "data": {"mine": {"userId": user_id, "userName": user_name}},
+        }
+        routes[ROLE_URL] = {
+            "code": 200,
+            "msg": "请求成功",
+            "success": True,
+            "data": {"defaultRoleList": roles},
+        }
+
+        def fake_post(url, data=None, timeout=None, **kwargs):
+            self.post_urls.append(url)
+            if url == SIGN_URL:
+                self.sign_payloads.append(dict(data or {}))
+            return _response(routes[url])
+
+        self.mock_post.side_effect = fake_post
+
+    def test_picks_wuwa_role_when_zhanshuang_comes_first(self):
+        self._serve([self.ZHANSHUANG_ROLE, self.WUWA_ROLE])
+
+        result = checkin_account(1, TOKEN_A)
+
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(len(self.sign_payloads), 1)
+        payload = self.sign_payloads[0]
+        self.assertEqual(payload["gameId"], 3)
+        self.assertEqual(payload["roleId"], "130468743")
+        self.assertEqual(payload["serverId"], "76402e5b20be2c39f095a152090afddc")
+        # E3: the 战双 role must never be used for the 鸣潮 sign-in.
+        self.assertNotEqual(payload["gameId"], 2)
+        self.assertNotEqual(payload["roleId"], "27804034")
+
+    def test_no_wuwa_role_reports_clearly(self):
+        self._serve([self.ZHANSHUANG_ROLE])
+
+        result = checkin_account(1, TOKEN_A)
+
+        self.assertIs(result.ok, False)
+        self.assertIn("鸣潮", result.message)
+        self.assertIn("30188029", result.message)
+        self.assertNotIn(SIGN_URL, self.post_urls)
+
+    def test_role_without_game_id_is_skipped(self):
+        no_game_id = {"roleId": "111", "serverId": "999", "userId": 30188029}
+        self._serve([no_game_id, self.WUWA_ROLE])
+
+        result = checkin_account(1, TOKEN_A)
+
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(self.sign_payloads[0]["roleId"], "130468743")
+        # A missing gameId is "no match", not a crash.
+        with self.assertRaises(KurobbsClientException) as caught:
+            _select_wuwa_role([no_game_id])
+        self.assertNotIsInstance(caught.exception, KeyError)
+        self.assertIn("鸣潮", str(caught.exception))
+
+    def test_string_game_id_is_matched(self):
+        string_role = dict(self.WUWA_ROLE, gameId="3")
+        self._serve([dict(self.ZHANSHUANG_ROLE, gameId="2"), string_role])
+
+        result = checkin_account(1, TOKEN_A)
+
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(self.sign_payloads[0]["gameId"], WUWA_GAME_ID)
+        self.assertEqual(self.sign_payloads[0]["roleId"], "130468743")
+
+
+class SignActionIsolationTest(unittest.TestCase):
+    """单元 F: a failing action must not skip the other one in start()."""
+
+    WUWA_ROLE = {
+        "gameId": 3,
+        "roleId": "130468743",
+        "serverId": "76402e5b20be2c39f095a152090afddc",
+        "userId": 30188029,
+    }
+    # 战双 only: checkin() raises "没有绑定鸣潮角色" before it ever posts /encourage.
+    ZHANSHUANG_ROLE = {
+        "gameId": 2,
+        "roleId": "27804034",
+        "serverId": "1000",
+        "userId": 30188029,
+    }
+
+    def setUp(self):
+        patcher = patch("requests.Session.post")
+        self.mock_post = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.post_urls = []
+
+    def _serve(self, roles, overrides=None):
+        routes = dict(ROUTES)
+        routes[MINE_URL] = {
+            "code": 200,
+            "msg": "请求成功",
+            "success": True,
+            "data": {"mine": {"userId": 30188029, "userName": "丿一阵雨"}},
+        }
+        routes[ROLE_URL] = {
+            "code": 200,
+            "msg": "请求成功",
+            "success": True,
+            "data": {"defaultRoleList": roles},
+        }
+        routes.update(overrides or {})
+
+        def fake_post(url, data=None, timeout=None, **kwargs):
+            self.post_urls.append(url)
+            payload = routes[url]
+            if isinstance(payload, Exception):
+                raise payload
+            return _response(payload)
+
+        self.mock_post.side_effect = fake_post
+        return routes
+
+    def test_checkin_failure_still_runs_sign_in(self):
+        """E8-1: 只有战双角色时，社区签到仍要执行一次。"""
+        self._serve([self.ZHANSHUANG_ROLE])
+
+        client = KurobbsClient(TOKEN_A)
+        with self.assertRaises(KurobbsClientException) as caught:
+            client.start()
+
+        self.assertIn("鸣潮", str(caught.exception))
+        self.assertEqual(self.post_urls.count(USER_SIGN_URL), 1)
+        self.assertEqual(client.result["sign_in"], "社区签到成功")
+        self.assertNotIn("checkin", client.result)
+        self.assertEqual(len(client.exceptions), 1)
+
+    def test_sign_in_failure_keeps_checkin_success(self):
+        """E8-2: 反向门，社区签到抛异常时 checkin 的成功结果必须留下。"""
+        self._serve(
+            [self.WUWA_ROLE],
+            {USER_SIGN_URL: requests.ConnectionError("connection reset by peer")},
+        )
+
+        client = KurobbsClient(TOKEN_A)
+        with self.assertRaises(KurobbsClientException) as caught:
+            client.start()
+
+        message = str(caught.exception)
+        self.assertEqual(client.result["checkin"], "签到奖励签到成功")
+        self.assertIn("社区签到失败", message)
+        self.assertIn("connection reset by peer", message)
+        self.assertEqual(self.post_urls.count(SIGN_URL), 1)
+        self.assertEqual(self.post_urls.count(USER_SIGN_URL), 1)
+
+    def test_unexpected_exception_is_not_swallowed(self):
+        """Only KurobbsClientException is isolated; real bugs keep propagating."""
+        self._serve([self.WUWA_ROLE])
+        client = KurobbsClient(TOKEN_A)
+
+        def broken_checkin():
+            raise ValueError("real bug")
+
+        client.checkin = broken_checkin
+        with self.assertRaises(ValueError):
+            client.start()
+
+        self.assertEqual(self.post_urls, [])
+        self.assertEqual(client.exceptions, [])
 
 
 if __name__ == "__main__":

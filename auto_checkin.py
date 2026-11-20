@@ -36,6 +36,36 @@ class KurobbsClientException(Exception):
 ALREADY_SIGNED_CODES = frozenset({1511})
 _ALREADY_SIGNED_MSG = re.compile(r"已签到|已经签到|重复签到|签到过了")
 
+# The reward check-in endpoint (/encourage/signIn/v2) is the 鸣潮 (Wuthering Waves)
+# sign-in. `defaultRoleList` is ordered by the server and can put another game
+# first (e.g. 战双 Punishing: Gray Raven is gameId=2), so the role must be picked
+# by game id instead of by position: a wrong game id still answers code=200, the
+# sign-in then silently lands in the other game.
+WUWA_GAME_ID = 3
+
+
+def _role_game_id(role: Any) -> int:
+    """`gameId` of a role entry as int, or -1 when absent/unparseable."""
+    if not isinstance(role, dict):
+        return -1
+    try:
+        return int(role.get("gameId", -1))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _select_wuwa_role(
+    role_list: Sequence[Dict[str, Any]], user_id: Any = None
+) -> Dict[str, Any]:
+    """Return the first role whose gameId is 3 (鸣潮). Raises when absent."""
+    for role in role_list or []:
+        if _role_game_id(role) == WUWA_GAME_ID:
+            return role
+    account = f"账号 {user_id}" if user_id is not None else "当前账号"
+    raise KurobbsClientException(
+        f"{account} 没有绑定鸣潮角色（gameId={WUWA_GAME_ID}），无法签到"
+    )
+
 
 def _beijing_timezone():
     """Asia/Shanghai time zone, falling back to a fixed +08:00 offset.
@@ -138,7 +168,8 @@ class KurobbsClient:
     def checkin(self) -> Response:
         """Perform the check-in operation."""
         mine_info = self.get_mine_info()
-        user_game_list = self.get_user_game_list(user_id=mine_info.get("mine", {}).get("userId", 0))
+        user_id = mine_info.get("mine", {}).get("userId", 0)
+        user_game_list = self.get_user_game_list(user_id=user_id)
 
         beijing_tz = _beijing_timezone()
         beijing_time = datetime.now(beijing_tz)
@@ -146,10 +177,18 @@ class KurobbsClient:
         role_list = user_game_list.get("defaultRoleList") or []
         if not role_list:
             raise KurobbsClientException("No default role found for the user.")
-        role_info = role_list[0]
+        role_info = _select_wuwa_role(role_list, user_id=user_id)
+
+        logger.debug(
+            "checkin role: gameId={}, roleId={}, serverId={}, userId={}",
+            WUWA_GAME_ID,
+            role_info.get("roleId"),
+            role_info.get("serverId"),
+            role_info.get("userId", 0),
+        )
 
         data = {
-            "gameId": role_info.get("gameId", 2),
+            "gameId": WUWA_GAME_ID,
             "serverId": role_info.get("serverId"),
             "roleId": role_info.get("roleId", 0),
             "userId": role_info.get("userId", 0),
@@ -179,8 +218,20 @@ class KurobbsClient:
         success_message: str,
         failure_message: str,
     ):
-        """Handle the common logic for sign-in actions."""
-        resp = action_method()
+        """Handle the common logic for sign-in actions.
+
+        A ``KurobbsClientException`` raised by the action itself (no default role,
+        no 鸣潮 role, network failure) is recorded and swallowed here so the next
+        action still runs: ``start()`` is meant to attempt both actions and only
+        then report the aggregated failure from ``_log()``. Anything else (a real
+        bug) keeps propagating.
+        """
+        try:
+            resp = action_method()
+        except KurobbsClientException as exc:
+            self.exceptions.append(KurobbsClientException(f"{failure_message}: {exc}"))
+            logger.error("{} -> 失败: {}", action_name, exc)
+            return
         if resp.success:
             self.result[action_name] = success_message
             logger.info("{} -> {}", action_name, success_message)
